@@ -1,0 +1,96 @@
+# %%
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+import torch
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+
+# %%
+df = pd.read_csv('data/household_power_consumption.txt', sep=';', 
+                 na_values=['?', 'nan'], low_memory=False).dropna()
+numeric_cols = ['Global_active_power', 'Global_reactive_power', 'Voltage', 
+                'Global_intensity', 'Sub_metering_1', 'Sub_metering_2', 
+                'Sub_metering_3']
+df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+df['datetime'] = pd.to_datetime(df.pop('Date') + ' ' + df.pop('Time'))
+
+# %%
+train, test = df[df.datetime <= '2009-12-31'], df[df.datetime > '2009-12-31']
+scaler = MinMaxScaler().fit(train[numeric_cols])
+train_scaled, test_scaled = scaler.transform(train[numeric_cols]), scaler.transform(test[numeric_cols])
+
+# %%
+def create_sequences(data, seq_length=24):
+    return np.stack([data[i:i+seq_length] for i in range(len(data)-seq_length)]), data[seq_length:, 0]
+
+X_train, y_train = create_sequences(train_scaled)
+X_test, y_test = create_sequences(test_scaled)
+
+# %%
+def create_dataloader(X, y, batch_size=64, shuffle=True):
+    dataset = TensorDataset(torch.tensor(X, dtype=torch.float32), 
+                           torch.tensor(y, dtype=torch.float32))
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+train_loader = create_dataloader(X_train, y_train)
+test_loader = create_dataloader(X_test, y_test, shuffle=False)
+
+# %%
+class PowerLSTM(nn.Module):
+    def __init__(self, input_size=7, hidden_size=50, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.linear = nn.Linear(hidden_size, 1)
+    
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.linear(out[:, -1])
+
+# %%
+def train_model(model, loader, criterion, optimizer, epochs=10):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for X, y in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(X.to(device)), y.unsqueeze(1).to(device))
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f'Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(loader):.4f}')
+
+def evaluate_model(model, loader, criterion):
+    model.eval()
+    preds, actuals = [], []
+    with torch.no_grad():
+        for X, y in loader:
+            pred = model(X.to(device)).cpu().numpy()
+            preds.extend(pred)
+            actuals.extend(y.numpy())
+    return np.array(preds).flatten(), np.array(actuals)
+
+# %%
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = PowerLSTM().to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+train_model(model, train_loader, criterion, optimizer)
+
+# %%
+preds, actuals = evaluate_model(model, test_loader, criterion)
+preds = scaler.inverse_transform(np.column_stack([preds, np.zeros((len(preds), 6))]))[:, 0]
+actuals = scaler.inverse_transform(np.column_stack([actuals, np.zeros((len(actuals), 6))]))[:, 0]
+
+print(f'RMSE: {np.sqrt(mean_squared_error(actuals, preds)):.2f}')
+
+# %%
+plt.figure(figsize=(12, 6))
+plt.plot(actuals[:200], label='Actual')
+plt.plot(preds[:200], label='Predicted')
+plt.title('Power Consumption Prediction')
+plt.legend()
+plt.show()
